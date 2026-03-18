@@ -1,15 +1,16 @@
 # ============================================================
 # Module: rag_pipeline.py
 # Purpose: Orchestrate the full RAG flow:
-#          Query → Embed → Endee vector search → Context
+#          Query → Embed → Vector search → Context
 #          assembly → LLM generation → Structured response.
+#
+#          Supports both Endee and local fallback vector store.
 # ============================================================
 
 import os
 import json
 
 from openai import OpenAI
-from endee import Endee
 from dotenv import load_dotenv
 
 from modules.embeddings import EmbeddingEngine
@@ -18,8 +19,6 @@ load_dotenv()
 
 # ---------------------------------------------------------------------------
 # System prompt for the cybersecurity assistant.
-# It instructs the LLM to behave as a senior security analyst and use the
-# retrieved context to produce structured, actionable answers.
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """You are **CyberSentinel AI**, a senior cybersecurity analyst and threat intelligence expert.
 
@@ -43,6 +42,29 @@ Your role is to provide accurate, detailed, and actionable cybersecurity informa
 """
 
 
+def _connect_vector_store():
+    """
+    Connect to Endee if available; otherwise use local fallback.
+    """
+    host = os.getenv("ENDEE_HOST", "localhost")
+    port = os.getenv("ENDEE_PORT", "8080")
+
+    try:
+        from endee import Endee
+        import urllib.request
+
+        url = f"http://{host}:{port}/api/v1"
+        req = urllib.request.Request(url, method="GET")
+        urllib.request.urlopen(req, timeout=2)
+
+        client = Endee()
+        client.set_base_url(url)
+        return client, False
+    except Exception:
+        from modules.local_vector_store import LocalVectorStoreManager
+        return LocalVectorStoreManager(), True
+
+
 class RAGPipeline:
     """
     End-to-end Retrieval-Augmented Generation pipeline for
@@ -50,7 +72,7 @@ class RAGPipeline:
 
     Flow:
         1. Embed the user query
-        2. Search Endee for top-k similar entries
+        2. Search vector store for top-k similar entries
         3. Assemble context from retrieved metadata
         4. Send system prompt + context + query to the LLM
         5. Return the generated answer
@@ -58,28 +80,29 @@ class RAGPipeline:
 
     INDEX_NAME = "cyber_knowledge"
 
-    def __init__(self):
+    def __init__(self, vector_client=None, is_local=False):
         self.embedding_engine = EmbeddingEngine()
-        self.endee_client = self._connect_endee()
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.llm_model = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
+        if vector_client:
+            self.vector_client = vector_client
+            self.is_local = is_local
+        else:
+            self.vector_client, self.is_local = _connect_vector_store()
+
+        # Use Groq (free tier) with OpenAI-compatible client
+        # Get your free key at: https://console.groq.com/keys
+        api_key = os.getenv("GROQ_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+        base_url = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+        self.openai_client = OpenAI(api_key=api_key, base_url=base_url)
+        self.llm_model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _connect_endee(self) -> Endee:
-        """Create and configure the Endee client."""
-        host = os.getenv("ENDEE_HOST", "localhost")
-        port = os.getenv("ENDEE_PORT", "8080")
-        client = Endee()
-        client.set_base_url(f"http://{host}:{port}/api/v1")
-        return client
-
     @staticmethod
     def _format_context(results: list) -> str:
         """
-        Convert Endee search results into a readable context block
+        Convert search results into a readable context block
         that can be included in the LLM prompt.
         """
         if not results:
@@ -88,7 +111,6 @@ class RAGPipeline:
         context_parts = []
         for i, result in enumerate(results, 1):
             meta = result.get("meta", {}) if isinstance(result, dict) else {}
-            # Handle both dict and object-style results
             if not meta and hasattr(result, "meta"):
                 meta = result.meta or {}
 
@@ -101,7 +123,6 @@ class RAGPipeline:
             tools_raw = meta.get("tools", "[]")
             severity = meta.get("severity", "")
 
-            # Parse tools (stored as JSON string in Endee metadata)
             try:
                 tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
             except (json.JSONDecodeError, TypeError):
@@ -126,18 +147,10 @@ class RAGPipeline:
 
     def search_knowledge_base(self, query: str, top_k: int = 3) -> list:
         """
-        Embed the query and perform a vector similarity search
-        against the Endee cyber_knowledge index.
-
-        Args:
-            query:  User's natural language question.
-            top_k:  Number of most-similar results to retrieve.
-
-        Returns:
-            List of search result objects from Endee.
+        Embed the query and perform a vector similarity search.
         """
         query_vector = self.embedding_engine.embed_text(query)
-        index = self.endee_client.get_index(name=self.INDEX_NAME)
+        index = self.vector_client.get_index(name=self.INDEX_NAME)
         results = index.query(vector=query_vector, top_k=top_k)
         return results
 
@@ -150,21 +163,12 @@ class RAGPipeline:
         """
         Full RAG pipeline: retrieve context, optionally blend in
         memory, then generate a response with the LLM.
-
-        Args:
-            query:           User question.
-            top_k:           Number of knowledge-base hits to use.
-            memory_context:  Optional string of past interaction context
-                             from the MemoryManager.
-
-        Returns:
-            dict with keys: "answer", "sources", "query"
         """
-        # Step 1 — Retrieve relevant context from Endee
+        # Step 1 — Retrieve relevant context
         search_results = self.search_knowledge_base(query, top_k=top_k)
         context = self._format_context(search_results)
 
-        # Step 2 — Build the user message with context + optional memory
+        # Step 2 — Build the user message
         user_message_parts = [
             f"**User Query:** {query}\n",
             f"**Retrieved Context from Knowledge Base:**\n{context}\n",
@@ -190,12 +194,12 @@ class RAGPipeline:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.3,  # Low temperature for factual accuracy
+            temperature=0.3,
             max_tokens=1500,
         )
         answer = response.choices[0].message.content
 
-        # Step 4 — Extract source titles for attribution
+        # Step 4 — Extract source titles
         sources = []
         for result in search_results:
             meta = result.get("meta", {}) if isinstance(result, dict) else {}

@@ -4,12 +4,14 @@
 #          ingest it into the Endee vector database. Handles
 #          index creation, text concatenation for embedding,
 #          and batch upsert with metadata payloads.
+#
+#          Falls back to a local in-memory vector store if
+#          Endee is not available (no Docker required).
 # ============================================================
 
 import json
 import os
 
-from endee import Endee, Precision
 from dotenv import load_dotenv
 
 from modules.embeddings import EmbeddingEngine
@@ -17,19 +19,50 @@ from modules.embeddings import EmbeddingEngine
 load_dotenv()
 
 
+def _connect_endee():
+    """
+    Try to connect to the Endee server. If it's not available,
+    fall back to the local in-memory vector store.
+
+    Returns:
+        (client, is_local) — the client object and a boolean flag
+        indicating whether we're using the local fallback.
+    """
+    host = os.getenv("ENDEE_HOST", "localhost")
+    port = os.getenv("ENDEE_PORT", "8080")
+
+    try:
+        from endee import Endee
+        import urllib.request
+
+        # Quick connectivity check before using the SDK
+        url = f"http://{host}:{port}/api/v1"
+        req = urllib.request.Request(url, method="GET")
+        urllib.request.urlopen(req, timeout=2)
+
+        client = Endee()
+        client.set_base_url(url)
+        print("[DataLoader] ✅ Connected to Endee server.")
+        return client, False
+    except Exception as e:
+        print(f"[DataLoader] ⚠️ Endee not available ({e}). Using local vector store.")
+        from modules.local_vector_store import LocalVectorStoreManager
+        return LocalVectorStoreManager(), True
+
+
 class DataLoader:
     """
     Responsible for:
     1. Reading cyber_data.json from disk.
-    2. Creating (or reusing) an Endee index for the knowledge base.
-    3. Embedding each entry's combined text and upserting into Endee.
+    2. Creating (or reusing) an index for the knowledge base.
+    3. Embedding each entry's combined text and upserting into the store.
     """
 
     INDEX_NAME = "cyber_knowledge"
 
     def __init__(self):
         self.embedding_engine = EmbeddingEngine()
-        self.client = self._connect_endee()
+        self.client, self.is_local = _connect_endee()
         self.data_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "data",
@@ -39,18 +72,6 @@ class DataLoader:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-
-    def _connect_endee(self) -> Endee:
-        """
-        Create and return an Endee client connected to the local server.
-        Reads host/port from environment variables with sensible defaults.
-        """
-        host = os.getenv("ENDEE_HOST", "localhost")
-        port = os.getenv("ENDEE_PORT", "8080")
-
-        client = Endee()
-        client.set_base_url(f"http://{host}:{port}/api/v1")
-        return client
 
     @staticmethod
     def _build_document_text(entry: dict) -> str:
@@ -98,20 +119,26 @@ class DataLoader:
 
     def initialize_index(self):
         """
-        Create the Endee index for the cybersecurity knowledge base.
-        Uses cosine similarity and INT8 precision (quantised storage)
-        for a good balance of accuracy and memory efficiency.
+        Create the index for the cybersecurity knowledge base.
+        Uses cosine similarity and INT8 precision (when using Endee).
 
         If the index already exists, this is a no-op.
         """
         try:
-            self.client.create_index(
-                name=self.INDEX_NAME,
-                dimension=self.embedding_engine.dimension,  # 384
-                space_type="cosine",
-                precision=Precision.INT8,
-            )
-            print(f"[DataLoader] Created Endee index '{self.INDEX_NAME}'")
+            if self.is_local:
+                self.client.create_index(
+                    name=self.INDEX_NAME,
+                    dimension=self.embedding_engine.dimension,
+                )
+            else:
+                from endee import Precision
+                self.client.create_index(
+                    name=self.INDEX_NAME,
+                    dimension=self.embedding_engine.dimension,  # 384
+                    space_type="cosine",
+                    precision=Precision.INT8,
+                )
+            print(f"[DataLoader] Created index '{self.INDEX_NAME}'")
         except Exception as e:
             # Index already exists — safe to continue
             if "already exists" in str(e).lower():
@@ -124,7 +151,7 @@ class DataLoader:
         Full ingestion pipeline:
         1. Load JSON dataset.
         2. Generate embeddings for each entry.
-        3. Upsert vectors + metadata into Endee.
+        3. Upsert vectors + metadata into the store.
 
         Returns:
             The number of records ingested.
@@ -161,7 +188,7 @@ class DataLoader:
                 }
             )
 
-        # --- Upsert into Endee in batches of 50 -------------------------
+        # --- Upsert in batches of 50 ------------------------------------
         index = self.client.get_index(name=self.INDEX_NAME)
         batch_size = 50
         for i in range(0, len(records), batch_size):
@@ -170,5 +197,6 @@ class DataLoader:
             print(f"[DataLoader] Upserted batch {i // batch_size + 1} "
                   f"({len(batch)} records)")
 
-        print(f"[DataLoader] ✅ Ingested {len(records)} records into Endee.")
+        backend = "local store" if self.is_local else "Endee"
+        print(f"[DataLoader] ✅ Ingested {len(records)} records into {backend}.")
         return len(records)
